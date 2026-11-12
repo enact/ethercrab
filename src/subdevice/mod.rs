@@ -52,18 +52,19 @@ pub use dc::DcSync;
 /// the group. Replaying the bytes is a handful of register writes.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) struct RecoveryImage {
-    pub sync_managers: [[u8; 8]; 8],
-    pub fmmus: [[u8; 16]; 16],
+    pub sync_managers: [[u8; 8]; MAX_SYNC_MANAGERS as usize],
+    pub fmmus: [[u8; 16]; MAX_FMMUS as usize],
+    /// How many of each this SubDevice implements, and so how many of the
+    /// arrays above carry anything.
+    pub sync_manager_count: u8,
+    pub fmmu_count: u8,
 }
 
-impl Default for RecoveryImage {
-    fn default() -> Self {
-        Self {
-            sync_managers: [[0u8; 8]; 8],
-            fmmus: [[0u8; 16]; 16],
-        }
-    }
-}
+/// The most sync managers the ESC address map has room for.
+const MAX_SYNC_MANAGERS: u8 = 16;
+
+/// The most FMMUs the ESC address map has room for.
+const MAX_FMMUS: u8 = 16;
 
 /// SubDevice device metadata. See [`SubDeviceRef`] for richer behaviour.
 #[doc(alias = "Slave")]
@@ -1143,16 +1144,35 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
     ///
     /// [`SubDeviceGroup::recover_subdevice`]: crate::SubDeviceGroup::recover_subdevice
     pub(crate) async fn capture_recovery_image(&self) -> Result<RecoveryImage, Error> {
-        let mut image = RecoveryImage::default();
+        // As many as this SubDevice declares, not as many as the address map
+        // has room for: reading a sync manager or FMMU it does not implement
+        // answers nothing, and a working counter of zero is an error.
+        let sync_managers = self
+            .read(RegisterAddress::SyncManagerChannels)
+            .receive::<u8>(self.maindevice)
+            .await?
+            .min(MAX_SYNC_MANAGERS);
+        let fmmus = self
+            .read(RegisterAddress::FmmuCount)
+            .receive::<u8>(self.maindevice)
+            .await?
+            .min(MAX_FMMUS);
 
-        for index in 0..8u8 {
+        let mut image = RecoveryImage {
+            sync_managers: [[0u8; 8]; MAX_SYNC_MANAGERS as usize],
+            fmmus: [[0u8; 16]; MAX_FMMUS as usize],
+            sync_manager_count: sync_managers,
+            fmmu_count: fmmus,
+        };
+
+        for index in 0..sync_managers {
             image.sync_managers[usize::from(index)] = self
                 .read(RegisterAddress::sync_manager(index))
                 .receive::<[u8; 8]>(self.maindevice)
                 .await?;
         }
 
-        for index in 0..16u8 {
+        for index in 0..fmmus {
             image.fmmus[usize::from(index)] = self
                 .read(RegisterAddress::fmmu(index))
                 .receive::<[u8; 16]>(self.maindevice)
@@ -1165,13 +1185,13 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
     /// Write `image` back into this SubDevice's sync manager and FMMU
     /// registers, mapping it into its group's process data again.
     pub(crate) async fn restore_recovery_image(&self, image: &RecoveryImage) -> Result<(), Error> {
-        for index in 0..8u8 {
+        for index in 0..image.sync_manager_count {
             self.write(RegisterAddress::sync_manager(index))
                 .send(self.maindevice, image.sync_managers[usize::from(index)])
                 .await?;
         }
 
-        for index in 0..16u8 {
+        for index in 0..image.fmmu_count {
             self.write(RegisterAddress::fmmu(index))
                 .send(self.maindevice, image.fmmus[usize::from(index)])
                 .await?;
