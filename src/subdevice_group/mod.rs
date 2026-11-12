@@ -636,6 +636,105 @@ impl<const MAX_SUBDEVICES: usize, const MAX_PDI: usize, R: RawRwLock, S, DC>
         self.inner().subdevices.is_empty()
     }
 
+    /// Bring one SubDevice that fell out of the process data back into it,
+    /// leaving every other SubDevice in this group where it is.
+    ///
+    /// A SubDevice that dropped off the network and came back has lost the
+    /// sync manager and FMMU configuration group startup wrote into it, so
+    /// walking its AL state alone leaves it refusing OP with
+    /// `SyncManagerWatchdog`: it is mapped nowhere, so no process data reaches
+    /// it. This walks it down to INIT, writes that configuration back at the
+    /// offsets it already owns in this group's PDI, and walks it up to OP
+    /// again. No other SubDevice is addressed and the group's PDI layout does
+    /// not move, so the rest of the group keeps exchanging throughout.
+    ///
+    /// The SubDevice must come back with the process data mapping it had
+    /// before: a mapping of a different size would need PDI this group has
+    /// already given to its neighbours, and is refused rather than written
+    /// over their data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if `index` addresses no SubDevice in this
+    /// group, and [`Error::PdiTooLong`] if the SubDevice came back mapped
+    /// differently. Any error leaves the SubDevice out of the process data,
+    /// which is where it already was.
+    pub async fn recover_subdevice(
+        &mut self,
+        maindevice: &MainDevice<'_>,
+        index: usize,
+    ) -> Result<(), Error> {
+        let inner = self.inner.get_mut();
+        let group_start = inner.pdi_start.start_address;
+
+        let subdevice = inner.subdevices.get_mut(index).ok_or(Error::NotFound {
+            item: Item::SubDevice,
+            index: Some(index),
+        })?;
+
+        // The offsets this SubDevice already owns. Replaying them is what
+        // holds the group's PDI layout still: every write below lands exactly
+        // where group startup put it.
+        let had = subdevice.config.io.clone();
+        let input_start = PdiOffset {
+            start_address: group_start + had.input.bytes.start as u32,
+        };
+        let output_start = PdiOffset {
+            start_address: group_start + had.output.bytes.start as u32,
+        };
+
+        let configured_address = subdevice.configured_address();
+
+        fmt::debug!(
+            "Recovering SubDevice {:#06x} into inputs {:?}, outputs {:?}",
+            configured_address,
+            had.input,
+            had.output
+        );
+
+        let mut subdevice = SubDeviceRef::new(maindevice, configured_address, subdevice);
+
+        // Through INIT rather than straight to PRE-OP: the mailbox sync
+        // managers `configure_mailboxes` writes are only accepted there, and a
+        // SubDevice that came back reports whatever state it powered up in
+        // rather than the one it left.
+        subdevice
+            .request_subdevice_state(SubDeviceState::Init)
+            .await?;
+
+        subdevice.configure_mailboxes().await?;
+
+        subdevice
+            .configure_fmmus(input_start, group_start, PdoDirection::MasterRead)
+            .await?;
+        subdevice
+            .configure_fmmus(output_start, group_start, PdoDirection::MasterWrite)
+            .await?;
+
+        if subdevice.config.io != had {
+            fmt::error!(
+                "SubDevice {:#06x} came back mapped inputs {:?}, outputs {:?}; group startup gave it inputs {:?}, outputs {:?}",
+                configured_address,
+                subdevice.config.io.input,
+                subdevice.config.io.output,
+                had.input,
+                had.output
+            );
+
+            return Err(Error::PdiTooLong {
+                max_length: had.input.len() + had.output.len(),
+                desired_length: subdevice.config.io.input.len() + subdevice.config.io.output.len(),
+            });
+        }
+
+        subdevice
+            .request_subdevice_state(SubDeviceState::SafeOp)
+            .await?;
+        subdevice.request_subdevice_state(SubDeviceState::Op).await?;
+
+        Ok(())
+    }
+
     /// Check if all SubDevices in the group are the given desired state.
     async fn is_state(
         &self,
