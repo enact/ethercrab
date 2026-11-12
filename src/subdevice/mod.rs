@@ -1108,7 +1108,11 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
                     Err(Error::WorkingCounter { .. }) => {
                         no_response += 1;
 
-                        // loop_tick is ~ms; ~500 misses ≈ ~1s of a subdevice not answering at all.
+                        // Counted in reads rather than time, so how long this
+                        // is depends on `wait_loop_delay`. The state
+                        // transition timeout is what actually bounds the wait;
+                        // this only says the silence is worth mentioning
+                        // before then.
                         if no_response % 500 == 0 {
                             fmt::warn!(
                                 "SubDevice {:#06x}: {} consecutive AL Status reads returned WKC=0 \
