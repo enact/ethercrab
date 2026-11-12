@@ -43,6 +43,28 @@ pub use self::types::SubDeviceIdentity;
 pub use coe::services::{ObjectDescriptionListQuery, ObjectDescriptionListQueryCounts};
 pub use dc::DcSync;
 
+/// The sync manager and FMMU registers group startup wrote into a SubDevice,
+/// kept so they can be written back without asking the SubDevice what they
+/// should be.
+///
+/// Re-deriving them means reading SII and every mapped PDO over CoE, which is
+/// hundreds of milliseconds during which no process data reaches the rest of
+/// the group. Replaying the bytes is a handful of register writes.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) struct RecoveryImage {
+    pub sync_managers: [[u8; 8]; 8],
+    pub fmmus: [[u8; 16]; 16],
+}
+
+impl Default for RecoveryImage {
+    fn default() -> Self {
+        Self {
+            sync_managers: [[0u8; 8]; 8],
+            fmmus: [[0u8; 16]; 16],
+        }
+    }
+}
+
 /// SubDevice device metadata. See [`SubDeviceRef`] for richer behaviour.
 #[doc(alias = "Slave")]
 #[derive(Debug)]
@@ -56,6 +78,10 @@ pub struct SubDevice {
     pub(crate) alias_address: u16,
 
     pub(crate) config: SubDeviceConfig,
+
+    /// What group startup wrote into this SubDevice's sync manager and FMMU
+    /// registers, or `None` before it has been configured.
+    pub(crate) recovery: Option<RecoveryImage>,
 
     pub(crate) identity: SubDeviceIdentity,
 
@@ -125,6 +151,7 @@ impl Clone for SubDevice {
             configured_address: self.configured_address,
             alias_address: self.alias_address,
             config: self.config.clone(),
+            recovery: self.recovery,
             identity: self.identity,
             name: self.name.clone(),
             dc_support: self.dc_support,
@@ -222,6 +249,7 @@ impl SubDevice {
         Ok(Self {
             configured_address,
             alias_address,
+            recovery: None,
             config: SubDeviceConfig::default(),
             index,
             parent_index: None,
@@ -1107,6 +1135,49 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
 
     pub(crate) fn read(&self, register: impl Into<u16>) -> WrappedRead {
         Command::fprd(self.configured_address, register.into())
+    }
+
+    /// Read back the sync manager and FMMU registers group startup wrote, so
+    /// [`SubDeviceGroup::recover_subdevice`] can put them back without asking
+    /// this SubDevice what they should be.
+    ///
+    /// [`SubDeviceGroup::recover_subdevice`]: crate::SubDeviceGroup::recover_subdevice
+    pub(crate) async fn capture_recovery_image(&self) -> Result<RecoveryImage, Error> {
+        let mut image = RecoveryImage::default();
+
+        for index in 0..8u8 {
+            image.sync_managers[usize::from(index)] = self
+                .read(RegisterAddress::sync_manager(index))
+                .receive::<[u8; 8]>(self.maindevice)
+                .await?;
+        }
+
+        for index in 0..16u8 {
+            image.fmmus[usize::from(index)] = self
+                .read(RegisterAddress::fmmu(index))
+                .receive::<[u8; 16]>(self.maindevice)
+                .await?;
+        }
+
+        Ok(image)
+    }
+
+    /// Write `image` back into this SubDevice's sync manager and FMMU
+    /// registers, mapping it into its group's process data again.
+    pub(crate) async fn restore_recovery_image(&self, image: &RecoveryImage) -> Result<(), Error> {
+        for index in 0..8u8 {
+            self.write(RegisterAddress::sync_manager(index))
+                .send(self.maindevice, image.sync_managers[usize::from(index)])
+                .await?;
+        }
+
+        for index in 0..16u8 {
+            self.write(RegisterAddress::fmmu(index))
+                .send(self.maindevice, image.fmmus[usize::from(index)])
+                .await?;
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn request_subdevice_state_nowait(

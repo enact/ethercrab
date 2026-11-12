@@ -19,6 +19,7 @@ use crate::{
     // lending_lock::LendingLock,
     pdi::PdiOffset,
     pdu_loop::{CreatedFrame, ReceivedPdu},
+    eeprom::types::SiiOwner,
     subdevice::{
         IoRanges, SubDevice, SubDeviceRef, configuration::PdoDirection, pdi::SubDevicePdi,
     },
@@ -130,11 +131,6 @@ struct GroupInner<const MAX_SUBDEVICES: usize> {
     subdevices: heapless::Vec<SubDevice, MAX_SUBDEVICES>,
     pdi_start: PdiOffset,
 }
-
-/// Process data cycles exchanged between the steps of
-/// [`SubDeviceGroup::recover_subdevice`], to hold the rest of the group in OP
-/// while one of its SubDevices is reconfigured.
-const WATCHDOG_FEED_CYCLES: usize = 4;
 
 /// Process data cycles [`SubDeviceGroup::recover_subdevice`] will exchange
 /// waiting for the recovered SubDevice to report OP.
@@ -249,6 +245,18 @@ impl<const MAX_SUBDEVICES: usize, const MAX_PDI: usize, R: RawRwLock, DC>
                     PdoDirection::MasterWrite,
                 )
                 .await?;
+        }
+
+        // Read back rather than reconstructed: what the SubDevice actually
+        // holds is what putting it back needs.
+        for index in 0..inner.subdevices.len() {
+            let configured_address = inner.subdevices[index].configured_address();
+            let image =
+                SubDeviceRef::new(maindevice, configured_address, &mut inner.subdevices[index])
+                    .capture_recovery_image()
+                    .await?;
+
+            inner.subdevices[index].recovery = Some(image);
         }
 
         fmt::debug!("SubDevice FMMUs configured for group. Able to move to SAFE-OP");
@@ -812,119 +820,69 @@ where
     /// in this group's PDI and walks it up to OP again. The group's PDI layout
     /// does not move, so the other SubDevices' images are untouched.
     ///
-    /// Process data is exchanged between each step and while waiting for OP.
-    /// That is not politeness: every SubDevice in the group has a sync manager
-    /// watchdog expecting cyclic frames, and a silent reconfiguration drops
-    /// the whole group to SAFE-OP around the one being recovered. It is also
-    /// what lets the recovered SubDevice reach OP at all, for the same reason
-    /// [`SubDeviceGroup::into_op`] exchanges rather than only waiting.
-    ///
-    /// The SubDevice must come back with the process data mapping it had
-    /// before: a mapping of a different size would need PDI this group has
-    /// already given to its neighbours, and is refused rather than written
-    /// over their data.
+    /// Replayed rather than re-derived: asking the SubDevice what its mapping
+    /// should be means reading SII and every mapped PDO over CoE, hundreds of
+    /// milliseconds in which no process data reaches the rest of the group —
+    /// long enough for its neighbours' sync manager watchdogs to drop them.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if `index` addresses no SubDevice in this
-    /// group, [`Error::PdiTooLong`] if it came back mapped differently, and
-    /// [`Error::StateTransition`] if it never reaches OP. Any error leaves it
-    /// out of the process data, which is where it already was.
+    /// group or startup never configured it, and [`Error::StateTransition`]
+    /// if it does not reach OP. Any error leaves it out of the process data,
+    /// which is where it already was.
     pub async fn recover_subdevice<'sto>(
         &mut self,
         maindevice: &'sto MainDevice<'sto>,
         index: usize,
     ) -> Result<(), Error> {
-        let (group_start, configured_address, had) = {
-            let inner = self.inner();
-            let subdevice = inner.subdevices.get(index).ok_or(Error::NotFound {
+        let (configured_address, image) = {
+            let subdevice = self.inner().subdevices.get(index).ok_or(Error::NotFound {
                 item: Item::SubDevice,
                 index: Some(index),
             })?;
 
             (
-                inner.pdi_start.start_address,
                 subdevice.configured_address(),
-                subdevice.config.io.clone(),
+                subdevice.recovery.ok_or(Error::NotFound {
+                    item: Item::SubDevice,
+                    index: Some(index),
+                })?,
             )
         };
 
-        // The offsets this SubDevice already owns. Replaying them is what
-        // holds the group's PDI layout still: every write below lands exactly
-        // where group startup put it.
-        let input_start = PdiOffset {
-            start_address: group_start + had.input.bytes.start as u32,
-        };
-        let output_start = PdiOffset {
-            start_address: group_start + had.output.bytes.start as u32,
-        };
+        fmt::debug!("Recovering SubDevice {:#06x}", configured_address);
 
-        fmt::debug!(
-            "Recovering SubDevice {:#06x} into inputs {:?}, outputs {:?}",
+        let subdevice = SubDeviceRef::new(
+            maindevice,
             configured_address,
-            had.input,
-            had.output
+            &mut self.inner.get_mut().subdevices[index],
         );
 
-        macro_rules! subdevice {
-            () => {
-                SubDeviceRef::new(
-                    maindevice,
-                    configured_address,
-                    &mut self.inner.get_mut().subdevices[index],
-                )
-            };
-        }
-
-        // Through INIT rather than straight to PRE-OP: the mailbox sync
-        // managers `configure_mailboxes` writes are only accepted there, and a
-        // SubDevice that came back reports whatever state it powered up in
-        // rather than the one it left.
-        subdevice!()
+        // Through INIT, where a SubDevice accepts its mailbox sync managers
+        // being rewritten, and which is where one that came back already is.
+        subdevice
             .request_subdevice_state(SubDeviceState::Init)
             .await?;
-        self.keep_group_alive(maindevice).await?;
 
-        subdevice!().configure_mailboxes().await?;
-        self.keep_group_alive(maindevice).await?;
+        subdevice.restore_recovery_image(&image).await?;
 
-        subdevice!()
-            .configure_fmmus(input_start, group_start, PdoDirection::MasterRead)
+        // Some SubDevices only leave INIT with the EEPROM handed to the PDI;
+        // ETG2010 p. 146, `Eeprom/@AssignToPd`.
+        subdevice.set_eeprom_mode(SiiOwner::Pdi).await?;
+        subdevice
+            .request_subdevice_state(SubDeviceState::PreOp)
             .await?;
-        self.keep_group_alive(maindevice).await?;
+        subdevice.set_eeprom_mode(SiiOwner::Master).await?;
 
-        subdevice!()
-            .configure_fmmus(output_start, group_start, PdoDirection::MasterWrite)
-            .await?;
-        self.keep_group_alive(maindevice).await?;
-
-        let mapped = self.inner().subdevices[index].config.io.clone();
-
-        if mapped != had {
-            fmt::error!(
-                "SubDevice {:#06x} came back mapped inputs {:?}, outputs {:?}; group startup gave it inputs {:?}, outputs {:?}",
-                configured_address,
-                mapped.input,
-                mapped.output,
-                had.input,
-                had.output
-            );
-
-            return Err(Error::PdiTooLong {
-                max_length: had.input.len() + had.output.len(),
-                desired_length: mapped.input.len() + mapped.output.len(),
-            });
-        }
-
-        subdevice!()
+        subdevice
             .request_subdevice_state(SubDeviceState::SafeOp)
             .await?;
-        self.keep_group_alive(maindevice).await?;
 
         // Asked for without waiting, then exchanged for: a SubDevice enters OP
         // only once its sync manager has seen the cyclic frames it is watching
         // for, so waiting in silence here times out every time.
-        subdevice!()
+        subdevice
             .request_subdevice_state_nowait(SubDeviceState::Op)
             .await?;
 
@@ -943,20 +901,6 @@ where
         );
 
         Err(Error::StateTransition)
-    }
-
-    /// Exchange process data, so the sync manager watchdogs of the SubDevices
-    /// that did not drop out do not expire while one of their neighbours is
-    /// being reconfigured.
-    async fn keep_group_alive<'sto>(
-        &self,
-        maindevice: &'sto MainDevice<'sto>,
-    ) -> Result<(), Error> {
-        for _ in 0..WATCHDOG_FEED_CYCLES {
-            self.tx_rx(maindevice).await?;
-        }
-
-        Ok(())
     }
 
     /// Borrow an individual SubDevice.
