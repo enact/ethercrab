@@ -56,6 +56,72 @@ impl Display for SdoExpedited {
     }
 }
 
+/// A normal (non-expedited) SDO download request, carrying its data after a
+/// four byte complete size.
+///
+/// Expedited download fits four bytes inside the SDO header itself; anything
+/// larger has to state its length and follow it with the data. Sized for the
+/// eight byte command objects a drive exposes (`0x1023`, the SOMANET safety
+/// module's, is one) — longer objects need segmentation, which this is not.
+#[derive(Debug, Copy, Clone, PartialEq, ethercrab_wire::EtherCrabWireReadWrite)]
+#[wire(bytes = 18)]
+pub struct SdoNormalDownload {
+    #[wire(bytes = 2)]
+    pub coe_header: CoeHeader,
+    #[wire(bytes = 4)]
+    pub sdo_header: SdoHeader,
+    /// How many of the bytes that follow the drive should read.
+    #[wire(bytes = 4)]
+    pub complete_size: u32,
+    #[wire(bytes = 8)]
+    pub data: [u8; 8],
+}
+
+/// The most bytes [`SdoNormalDownload`] can carry.
+pub const MAX_NORMAL_DOWNLOAD_LEN: usize = 8;
+
+impl SdoNormalDownload {
+    pub fn download(index: u16, access: SubIndex, data: [u8; 8], len: u8) -> SdoNormalDownload {
+        SdoNormalDownload {
+            coe_header: CoeHeader {
+                service: CoeService::SdoRequest,
+            },
+            sdo_header: SdoHeader {
+                size_indicator: true,
+                expedited_transfer: false,
+                // Only meaningful for an expedited transfer, where it says how
+                // many of the four header bytes are padding. The length lives
+                // in `complete_size` here.
+                size: 0,
+                complete_access: access.complete_access(),
+                command: CoeCommand::Download,
+                index,
+                sub_index: access.sub_index(),
+            },
+            complete_size: u32::from(len),
+            data,
+        }
+    }
+}
+
+impl Display for SdoNormalDownload {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "SDO normal download({:#06x}:{}, {} bytes",
+            self.sdo_header.index, self.sdo_header.sub_index, self.complete_size
+        )?;
+
+        if self.sdo_header.complete_access {
+            write!(f, " complete access)")?;
+        } else {
+            write!(f, ")")?;
+        }
+
+        Ok(())
+    }
+}
+
 /// A normal SDO request or response with no additional payload.
 ///
 /// These fields are common to non-segmented (i.e. "normal") SDO requests and responses.
@@ -351,6 +417,12 @@ pub trait CoeServiceRequest:
 }
 
 impl CoeServiceRequest for SdoExpedited {
+    fn validate_response(&self, received_index: u16, received_subindex: u8) -> bool {
+        received_index == self.sdo_header.index && received_subindex == self.sdo_header.sub_index
+    }
+}
+
+impl CoeServiceRequest for SdoNormalDownload {
     fn validate_response(&self, received_index: u16, received_subindex: u8) -> bool {
         received_index == self.sdo_header.index && received_subindex == self.sdo_header.sub_index
     }

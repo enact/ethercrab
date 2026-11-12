@@ -12,7 +12,8 @@ use crate::{
             self,
             services::{
                 CoeServiceRequest, ObjectDescriptionListRequest, ObjectDescriptionListResponse,
-                SdoExpedited, SdoNormal, SdoSegmented, SdoSegmentedUploadRequest, SdoUploadRequest,
+                MAX_NORMAL_DOWNLOAD_LEN, SdoExpedited, SdoNormal, SdoNormalDownload, SdoSegmented,
+                SdoSegmentedUploadRequest, SdoUploadRequest,
             },
         },
     },
@@ -252,20 +253,39 @@ where
     {
         let sub_index = sub_index.into();
 
-        if value.packed_len() > 4 {
-            fmt::error!("Only 4 byte SDO writes or smaller are supported currently.");
+        let len = value.packed_len();
 
-            // TODO: Normal SDO download. Only expedited requests for now
+        // Over four bytes the data no longer fits inside the SDO header, so it
+        // follows a stated length instead. Past what one mailbox holds it
+        // would have to be segmented, which this is not.
+        if len > MAX_NORMAL_DOWNLOAD_LEN {
+            fmt::error!(
+                "SDO writes longer than {} bytes need segmented download, which is unimplemented",
+                MAX_NORMAL_DOWNLOAD_LEN
+            );
+
             return Err(Error::Internal);
+        }
+
+        fmt::trace!("CoE download");
+
+        if len > 4 {
+            let mut buf = [0u8; MAX_NORMAL_DOWNLOAD_LEN];
+
+            value.pack_to_slice(&mut buf)?;
+
+            let request = SdoNormalDownload::download(index, sub_index, buf, len as u8);
+
+            let (_response, _data) = self.send_coe_service::<_, SdoNormal>(request).await?;
+
+            return Ok(());
         }
 
         let mut buf = [0u8; 4];
 
         value.pack_to_slice(&mut buf)?;
 
-        let request = SdoExpedited::download(index, sub_index, buf, value.packed_len() as u8);
-
-        fmt::trace!("CoE download");
+        let request = SdoExpedited::download(index, sub_index, buf, len as u8);
 
         let (_response, _data) = self.send_coe_service::<_, SdoNormal>(request).await?;
 
