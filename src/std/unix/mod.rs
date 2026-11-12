@@ -200,9 +200,10 @@ pub fn tx_rx_task_busy_poll<'sto>(
                     if n == 0 {
                         fmt::warn!("Received zero bytes");
                     }
+                    // A reply landing after its PDU timed out has no slot left; dropping
+                    // it costs that one exchange, returning would stop the pump for good.
                     if let Err(e) = pdu_rx.receive_frame(packet) {
-                        fmt::error!("Failed to receive frame: {}", e);
-                        return Err(Error::ReceiveFrame);
+                        fmt::warn!("Dropping a frame that matches no PDU in flight: {}", e);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
