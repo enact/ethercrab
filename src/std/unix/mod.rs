@@ -200,9 +200,9 @@ pub fn tx_rx_task_busy_poll<'sto>(
                     if n == 0 {
                         fmt::warn!("Received zero bytes");
                     }
+                    // One bad or late reply costs that frame, not the socket.
                     if let Err(e) = pdu_rx.receive_frame(packet) {
-                        fmt::error!("Failed to receive frame: {}", e);
-                        return Err(Error::ReceiveFrame);
+                        fmt::error!("Dropped a received frame: {}", e);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
