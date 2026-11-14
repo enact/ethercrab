@@ -13,6 +13,14 @@ pub struct MainDeviceConfig {
 
     /// EtherCAT packet (PDU) network retry behaviour.
     pub retry_behaviour: RetryBehaviour,
+
+    /// Subdevices, by (vendor_id, product_id), whose CoE PDO-assignment object
+    /// over-reports its entry count — sub-index 0 claims more than the device
+    /// serves, and reading the missing one aborts SubIndexNotFound. A listed
+    /// device's missing sub-index is tolerated as end-of-list; any other
+    /// device's is still a hard error. A fixed-map-terminal firmware quirk
+    /// (e.g. Beckhoff EL40xx outputs).
+    pub tolerate_missing_pdo_subindex: &'static [(u32, u32)],
 }
 
 impl Default for MainDeviceConfig {
@@ -20,6 +28,7 @@ impl Default for MainDeviceConfig {
         Self {
             dc_static_sync_iterations: 10_000,
             retry_behaviour: RetryBehaviour::default(),
+            tolerate_missing_pdo_subindex: &[],
         }
     }
 }

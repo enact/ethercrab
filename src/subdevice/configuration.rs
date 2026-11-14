@@ -5,10 +5,10 @@ use crate::{
         CoeDetails, DefaultMailbox, FmmuUsage, MailboxProtocols, SiiGeneral, SiiOwner, SyncManager,
         SyncManagerEnable, SyncManagerType,
     },
-    error::{Error, IgnoreNoCategory, Item},
+    error::{Error, IgnoreNoCategory, Item, MailboxError},
     fmmu::Fmmu,
     fmt,
-    mailbox::coe::SdoExpeditedPayload,
+    mailbox::coe::{CoeAbortCode, SdoExpeditedPayload},
     pdi::{PdiOffset, PdiSegment},
     register::RegisterAddress,
     subdevice::types::{Mailbox, MailboxConfig},
@@ -85,14 +85,16 @@ where
         }
 
         let has_coe = self.state.config.mailbox.has_coe;
+        let configure_pdos_over_coe = has_coe;
 
         fmt::debug!(
-            "SubDevice {:#06x} has CoE: {:?}",
+            "SubDevice {:#06x} has CoE: {:?}, PDO assign: {:?}",
             self.configured_address,
-            has_coe
+            has_coe,
+            self.state.config.mailbox.pdo_assign
         );
 
-        let range = if has_coe {
+        let range = if configure_pdos_over_coe {
             self.configure_pdos_coe(&sync_managers, &fmmu_usage, direction, &mut global_offset)
                 .await?
         } else {
@@ -258,6 +260,7 @@ where
             complete_access: general
                 .coe_details
                 .contains(CoeDetails::ENABLE_COMPLETE_ACCESS),
+            pdo_assign: general.coe_details.contains(CoeDetails::ENABLE_PDO_ASSIGN),
         };
 
         Ok(())
@@ -289,6 +292,14 @@ where
         let start_offset = *global_offset;
         // let mut total_bit_len = 0;
 
+        let tolerate_missing = {
+            let id = self.state.identity();
+            self.maindevice
+                .config
+                .tolerate_missing_pdo_subindex
+                .contains(&(id.vendor_id, id.product_id))
+        };
+
         for (sync_manager_index, sync_manager) in sync_managers.iter().enumerate() {
             let sync_manager_index = sync_manager_index as u8;
 
@@ -314,9 +325,32 @@ where
             let mut sm_bit_len = 0u16;
 
             for i in 1..=num_sm_assignments {
-                let pdo = self
+                let pdo = match self
                     .sdo_read_expedited::<u16>(sm_address, SubIndex::Index(i))
-                    .await?;
+                    .await
+                {
+                    Ok(pdo) => pdo,
+                    // A device may report more assignments in sub-index 0 than
+                    // it serves (a Beckhoff output-terminal firmware quirk, even
+                    // when the SII sets PDO-assign): reading the claimed entry
+                    // aborts SubIndexNotFound. Tolerate it as end-of-list, but
+                    // warn so a genuine mis-configuration stays visible.
+                    Err(Error::Mailbox(MailboxError::Aborted {
+                        code: CoeAbortCode::SubIndexNotFound,
+                        ..
+                    })) if tolerate_missing => {
+                        fmt::warn!(
+                            "SubDevice {:#06x} SM {:#06x} claims {} PDO assignment(s) but sub-index {} is missing; using the {} read so far",
+                            self.configured_address,
+                            sm_address,
+                            num_sm_assignments,
+                            i,
+                            i - 1
+                        );
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
                 let num_mappings = self
                     .sdo_read_expedited::<u8>(pdo, SubIndex::Index(0))
                     .await?;

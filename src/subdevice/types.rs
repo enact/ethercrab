@@ -58,6 +58,10 @@ pub struct MailboxConfig {
     pub has_coe: bool,
     /// True if Complete Access is supported.
     pub complete_access: bool,
+    /// True if the SII advertises CoE PDO assignment (`0x1C12`/`0x1C13`). A
+    /// fixed-map device leaves it clear and must be configured from its EEPROM
+    /// PDO map: reading the assignment objects it does not serve aborts.
+    pub pdo_assign: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
