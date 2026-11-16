@@ -11,7 +11,7 @@ use self::bpf::BpfDevice as RawSocketDesc;
 pub(in crate::std) use self::linux::RawSocketDesc;
 
 use crate::{
-    error::Error,
+    error::{Error, PduError},
     fmt,
     pdu_loop::{PduRx, PduTx},
 };
@@ -200,9 +200,17 @@ pub fn tx_rx_task_busy_poll<'sto>(
                     if n == 0 {
                         fmt::warn!("Received zero bytes");
                     }
-                    // One bad or late reply costs that frame, not the socket.
-                    if let Err(e) = pdu_rx.receive_frame(packet) {
-                        fmt::error!("Dropped a received frame: {}", e);
+                    // A reply to a frame that already timed out has no slot to claim:
+                    // it costs that frame, not the socket.
+                    match pdu_rx.receive_frame(packet) {
+                        Ok(_) => {}
+                        Err(Error::Pdu(PduError::InvalidIndex(index))) => {
+                            fmt::warn!("Dropped a reply to abandoned frame {}", index);
+                        }
+                        Err(e) => {
+                            fmt::error!("Failed to receive frame: {}", e);
+                            return Err(Error::ReceiveFrame);
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
